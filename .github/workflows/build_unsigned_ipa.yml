@@ -1,0 +1,105 @@
+name: Build Unsigned IPA (for sideloading)
+run-name: Build unsigned IPA (${{ github.ref_name }})
+
+# Builds Trio for real iPhones WITHOUT code signing and uploads an .ipa as a
+# workflow artifact. Sign and install it with Sideloadly (or similar) using a
+# free Apple ID. Free signing expires after 7 days - test drive only.
+#
+# Needs no secrets and no Apple Developer membership.
+
+on:
+  workflow_dispatch:
+    inputs:
+      strip_extensions:
+        description: "Remove Watch app and Live Activity (recommended for free Apple IDs)"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Select Xcode version
+        run: sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      # Same customization hook as build_trio.yml
+      - name: Apply local patches
+        run: |
+          if ls ./patches/* &> /dev/null; then
+            git apply ./patches/* --allow-empty -v --whitespace=fix
+          fi
+
+      # Config.xcconfig defaults DEVELOPER_TEAM to a placeholder that makes an
+      # invalid bundle identifier. Use a valid dummy; Sideloadly rewrites the
+      # bundle identifier when it signs anyway.
+      - name: Set placeholder team
+        run: echo 'DEVELOPER_TEAM = UNSIGNED' > ConfigOverride.xcconfig
+
+      - name: Build app (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -workspace Trio.xcworkspace \
+            -scheme Trio \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            | tee xcodebuild.log
+
+      - name: Surface build errors
+        if: failure()
+        run: |
+          grep -nE "error:|Undefined symbol|PhaseScriptExecution failed|BUILD FAILED" xcodebuild.log | tail -n 80 || true
+
+      - name: Package IPA
+        run: |
+          APP=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found in build products"
+            exit 1
+          fi
+          echo "Found $APP"
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          if [ "${{ inputs.strip_extensions }}" = "true" ]; then
+            # Each extension needs its own App ID; free Apple IDs are limited
+            # to 10 App IDs per week, and these aren't needed for a test drive.
+            rm -rf Payload/*.app/Watch Payload/*.app/PlugIns
+            echo "Removed Watch app and app extensions"
+          fi
+
+          VERSION=$(grep -E '^APP_VERSION' Config.xcconfig | awk -F'= ' '{print $2}' | tr -d ' ')
+          zip -qry "Trio-${VERSION}-unsigned.ipa" Payload
+          ls -lh *.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trio-unsigned-ipa
+          path: "*.ipa"
+          retention-days: 14
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
